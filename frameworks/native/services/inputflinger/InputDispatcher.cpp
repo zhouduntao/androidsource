@@ -235,18 +235,22 @@ void InputDispatcher::dispatchOnce() {
 
         // Run a dispatch loop if there are no pending commands.
         // The dispatch loop might enqueue commands to run afterwards.
+        //①dispatchOnceInnerLocked进行输入事件派发,nextWakeupTime决定下次派发线程循环执行的时间
         if (!haveCommandsLocked()) {
             dispatchOnceInnerLocked(&nextWakeupTime);
         }
 
         // Run all pending commands if there are any.
         // If any commands were run then force the next poll to wake up immediately.
+        //②执行命令队列中的命令
         if (runCommandsLockedInterruptible()) {
+            /*nextWakeupTime设置为LONG_LONG_LONG_MIN,派发线程立即开始下次线程循环*/
             nextWakeupTime = LONG_LONG_MIN;
         }
     } // release lock
 
     // Wait for callback or timeout or wake.  (make sure we round up, not down)
+    //③如果有必要,将派发线程进入休眠状态,并由nextWakeupTime确定休眠时间
     nsecs_t currentTime = now();
     int timeoutMillis = toMillisecondTimeoutDelay(currentTime, nextWakeupTime);
     mLooper->pollOnce(timeoutMillis);
@@ -263,6 +267,7 @@ void InputDispatcher::dispatchOnceInnerLocked(nsecs_t* nextWakeupTime) {
     }
 
     // If dispatching is frozen, do not process timeouts or try to deliver any new events.
+    /*如果InputDispatcher被冻结,不做任何派发操作,setInputDispatchmode*/
     if (mDispatchFrozen) {
 #if DEBUG_FOCUS
         ALOGD("Dispatch frozen.  Waiting some more.");
@@ -280,6 +285,7 @@ void InputDispatcher::dispatchOnceInnerLocked(nsecs_t* nextWakeupTime) {
 
     // Ready to start a new event.
     // If we don't already have a pending event, go grab one.
+    //①从派发队列取出一事件进行派发
     if (! mPendingEvent) {
         if (mInboundQueue.isEmpty()) {
             if (isAppSwitchDue) {
@@ -301,11 +307,14 @@ void InputDispatcher::dispatchOnceInnerLocked(nsecs_t* nextWakeupTime) {
             }
 
             // Nothing to do if there is no pending event.
+            /*如果派发队列是空的,直接返回.此时nextWakeupTime将保持LONG_LONG_MAX,进入无限休眠*/
             if (!mPendingEvent) {
                 return;
             }
         } else {
             // Inbound queue has at least one entry.
+            /*从派发队列的队首取出一条EventEntry,保存在mPendingEvent成员变量中.
+                mPendingEvent表示处于派发过程中的一个输入事件,之所以使用一个成员变量而不是局部变量,是因为此次线程循环有可能不能完成此事件的派发*/
             mPendingEvent = mInboundQueue.dequeueAtHead();
             traceInboundQueueLengthLocked();
         }
@@ -316,6 +325,7 @@ void InputDispatcher::dispatchOnceInnerLocked(nsecs_t* nextWakeupTime) {
         }
 
         // Get ready to dispatch the event.
+        //重置ANR信息
         resetANRTimeoutsLocked();
     }
 
@@ -323,17 +333,20 @@ void InputDispatcher::dispatchOnceInnerLocked(nsecs_t* nextWakeupTime) {
     // All events are eventually dequeued and processed this way, even if we intend to drop them.
     ALOG_ASSERT(mPendingEvent != NULL);
     bool done = false;
+    //②检查事件是否需要被丢弃,
     DropReason dropReason = DROP_REASON_NOT_DROPPED;
     if (!(mPendingEvent->policyFlags & POLICY_FLAG_PASS_TO_USER)) {
+        /*事件注入派发之前增向DispatcherPolicy询问过派发策略.如果不允许派发,则不派发,设置相应的reason*/
         dropReason = DROP_REASON_POLICY;
     } else if (!mDispatchEnabled) {
+        /*如果InputDispatcher被禁用,此事件也会被丢弃.*/
         dropReason = DROP_REASON_DISABLED;
     }
 
     if (mNextUnblockedEvent == mPendingEvent) {
         mNextUnblockedEvent = NULL;
     }
-
+    //根据不同事件采取不同的派发流程
     switch (mPendingEvent->type) {
     case EventEntry::TYPE_CONFIGURATION_CHANGED: {
         ConfigurationChangedEntry* typedEntry =
@@ -374,16 +387,20 @@ void InputDispatcher::dispatchOnceInnerLocked(nsecs_t* nextWakeupTime) {
 
     case EventEntry::TYPE_MOTION: {
         MotionEntry* typedEntry = static_cast<MotionEntry*>(mPendingEvent);
+        //事件因为HOME键没有及时响应而丢弃
         if (dropReason == DROP_REASON_NOT_DROPPED && isAppSwitchDue) {
             dropReason = DROP_REASON_APP_SWITCH;
         }
+        //事件因为过期而被丢弃
         if (dropReason == DROP_REASON_NOT_DROPPED
                 && isStaleEventLocked(currentTime, typedEntry)) {
             dropReason = DROP_REASON_STALE;
         }
+        //事件因为阻碍了其他窗口获得事件而被丢弃
         if (dropReason == DROP_REASON_NOT_DROPPED && mNextUnblockedEvent) {
             dropReason = DROP_REASON_BLOCKED;
         }
+        //③执行motion派发.如果派发完成,无论是派发成功还是事件被丢弃,都返回true,否则false,以便下次循环时尝试此事件派发
         done = dispatchMotionLocked(currentTime, typedEntry,
                 &dropReason, nextWakeupTime);
         break;
@@ -393,20 +410,24 @@ void InputDispatcher::dispatchOnceInnerLocked(nsecs_t* nextWakeupTime) {
         ALOG_ASSERT(false);
         break;
     }
-
+    //④如果事件派发完成,则准备派发下一个事件
     if (done) {
+        //如果事件因为某种原因被丢弃,为了保证窗口收到的事件仍能保持DOWN/UP, ENTER/EXIT的配对,还需要对事件进行补发
         if (dropReason != DROP_REASON_NOT_DROPPED) {
             dropInboundEventLocked(mPendingEvent, dropReason);
         }
         mLastDropReason = dropReason;
-
+        //设置mPendingEvent对象为NULL,重置ANR信息
         releasePendingEventLocked();
+        //立刻开始下一个循环,如果队列为空,下次循环调用此函数会保持nextWakeup-Time为LONG_LONG_MAX,进入无限休眠
         *nextWakeupTime = LONG_LONG_MIN;  // force next poll to wake up immediately
     }
 }
 
 bool InputDispatcher::enqueueInboundEventLocked(EventEntry* entry) {
+    //如果mInboundQueue为空,则代表此时派发线程处于休眠状态,需要唤醒
     bool needWake = mInboundQueue.isEmpty();
+    //将时间方法mInboudQueue尾部
     mInboundQueue.enqueueAtTail(entry);
     traceInboundQueueLengthLocked();
 
@@ -824,6 +845,7 @@ void InputDispatcher::logOutboundKeyDetailsLocked(const char* prefix, const KeyE
 bool InputDispatcher::dispatchMotionLocked(
         nsecs_t currentTime, MotionEntry* entry, DropReason* dropReason, nsecs_t* nextWakeupTime) {
     // Preprocessing.
+    //事件已进入派发流程
     if (! entry->dispatchInProgress) {
         entry->dispatchInProgress = true;
 
@@ -831,6 +853,7 @@ bool InputDispatcher::dispatchMotionLocked(
     }
 
     // Clean up if dropping the event.
+    //如果是被丢弃的事件,直接返回
     if (*dropReason != DROP_REASON_NOT_DROPPED) {
         setInjectionResultLocked(entry, *dropReason == DROP_REASON_POLICY
                 ? INPUT_EVENT_INJECTION_SUCCEEDED : INPUT_EVENT_INJECTION_FAILED);
@@ -844,20 +867,25 @@ bool InputDispatcher::dispatchMotionLocked(
 
     bool conflictingPointerActions = false;
     int32_t injectionResult;
+    //②根据motion事件类型,寻找合适的目标窗口.返回值injectionResult指明寻找结果,找到合适的目标窗口信息将会保存在inputTargets中
     if (isPointerEvent) {
         // Pointer event.  (eg. touchscreen)
+        /*对于基于坐标点形式的事件,如触摸屏点击,讲根据坐标点 窗口ZOrder与区域寻找目标窗口*/
         injectionResult = findTouchedWindowTargetsLocked(currentTime,
                 entry, inputTargets, nextWakeupTime, &conflictingPointerActions);
     } else {
         // Non touch event.  (eg. trackball)
+        //对于其它类型的Motion事件,例如轨迹球,将以拥有焦点的窗口作为目标
         injectionResult = findFocusedWindowTargetsLocked(currentTime,
                 entry, inputTargets, nextWakeupTime);
     }
+    //返回值PENDING表明找到了一个窗口,不过如果窗口处于无响应转台,则返回false,也就是说这个事件尚未派发完成,将在下次派发线程的循环中再次尝试派发
     if (injectionResult == INPUT_EVENT_INJECTION_PENDING) {
         return false;
     }
 
     setInjectionResultLocked(entry, injectionResult);
+    //如果返回值不为SUCCEEDED,表明无法为此事件找到合适的窗口,例如没有窗口处于焦点状态,或点击的位置没能落在任何一个窗口内,这个事件将会被丢弃
     if (injectionResult != INPUT_EVENT_INJECTION_SUCCEEDED) {
         if (injectionResult != INPUT_EVENT_INJECTION_PERMISSION_DENIED) {
             CancelationOptions::Mode mode(isPointerEvent ?
@@ -870,6 +898,7 @@ bool InputDispatcher::dispatchMotionLocked(
     }
 
     // TODO: support sending secondary display events to input monitors
+    //向inputTargets列表中添加特殊的接受目标,可以看出这些名为Monitoring targets的接受者可以监听所有的输入事件
     if (isMainDisplay(entry->displayId)) {
         addMonitoringTargetsLocked(inputTargets);
     }
@@ -880,6 +909,7 @@ bool InputDispatcher::dispatchMotionLocked(
                 "conflicting pointer actions");
         synthesizeCancelationEventsForAllConnectionsLocked(options);
     }
+    //③调用dispatchEventLocked 将事件派发给inputTargets[]
     dispatchEventLocked(currentTime, entry, inputTargets);
     return true;
 }
@@ -929,15 +959,17 @@ void InputDispatcher::dispatchEventLocked(nsecs_t currentTime,
     ALOG_ASSERT(eventEntry->dispatchInProgress); // should already have been set to true
 
     pokeUserActivityLocked(eventEntry);
-
+    //遍历inputTargets
     for (size_t i = 0; i < inputTargets.size(); i++) {
         const InputTarget& inputTarget = inputTargets.itemAt(i);
-
+        //根据InputTarget中的InputChannel,获取对应的Connection对象的索引
         ssize_t connectionIndex = getConnectionIndexLocked(inputTarget.inputChannel);
         if (connectionIndex >= 0) {
             sp<Connection> connection = mConnectionsByFd.valueAt(connectionIndex);
+            //调用prepareDispatchCycleLocked(),针对当前InputTarget启动事件发送循环
             prepareDispatchCycleLocked(currentTime, connection, eventEntry, &inputTarget);
         } else {
+            //如果没有对应的Connection,事件被丢弃
 #if DEBUG_FOCUS
             ALOGD("Dropping event delivery to target with channel '%s' because it "
                     "is no longer registered with the input dispatcher.",
@@ -1203,6 +1235,7 @@ int32_t InputDispatcher::findTouchedWindowTargetsLocked(nsecs_t currentTime,
         bool isTouchModal = false;
 
         // Traverse windows from front to back to find touched window and outside targets.
+        //①遍历mWindowHadles列表中所有的WindowHandle,检查事件坐标是否落在其上
         size_t numWindows = mWindowHandles.size();
         for (size_t i = 0; i < numWindows; i++) {
             sp<InputWindowHandle> windowHandle = mWindowHandles.itemAt(i);
@@ -1224,6 +1257,7 @@ int32_t InputDispatcher::findTouchedWindowTargetsLocked(nsecs_t currentTime,
 
                 if (maskedAction == AMOTION_EVENT_ACTION_DOWN
                         && (flags & InputWindowInfo::FLAG_WATCH_OUTSIDE_TOUCH)) {
+                    //把选中的窗口保存的TempTouchState中,以便后续处理
                     mTempTouchState.addOrUpdateWindow(
                             windowHandle, InputTarget::FLAG_DISPATCH_AS_OUTSIDE, BitSet32(0));
                 }
@@ -1404,15 +1438,20 @@ int32_t InputDispatcher::findTouchedWindowTargetsLocked(nsecs_t currentTime,
     }
 
     // Ensure all touched foreground windows are ready for new input.
+    //②检查tempTouchState中所有目标窗口是否已准备好接收新的输入事件
     for (size_t i = 0; i < mTempTouchState.windows.size(); i++) {
         const TouchedWindow& touchedWindow = mTempTouchState.windows[i];
         if (touchedWindow.targetFlags & InputTarget::FLAG_FOREGROUND) {
             // Check whether the window is ready for more input.
+
             String8 reason = checkWindowReadyForMoreInputLocked(currentTime,
                     touchedWindow.windowHandle, entry, "touched");
             if (!reason.isEmpty()) {
+             /*检查窗口是否可以接受新事件,如果不能则记录接收事件的原因,并设置nextWakeupTime为5s.如果5s后线程仍然未能将此事件派发陈宫而成功进入这个分分支,向JAVA层通报ANR
+            在这里,injectionResult被设置为INPUT_EVENT_INJECTION_PENDING,PENDING说明下次会继续派发此事件*/
                 injectionResult = handleTargetsNotReadyLocked(currentTime, entry,
                         NULL, touchedWindow.windowHandle, nextWakeupTime, reason.string());
+                //因为此次查找到的窗口不能接收事件,跳过后后续创产生的InputTarget过程
                 goto Unresponsive;
             }
         }
@@ -1445,6 +1484,7 @@ int32_t InputDispatcher::findTouchedWindowTargetsLocked(nsecs_t currentTime,
     }
 
     // Success!  Output targets.
+    //③执行到这个,说明窗口的查找过程一切顺利.设置injectionReslt为SUCCEEDED,将生成的InputTarget放入参数inputTargets中
     injectionResult = INPUT_EVENT_INJECTION_SUCCEEDED;
 
     for (size_t i = 0; i < mTempTouchState.windows.size(); i++) {
@@ -1827,7 +1867,7 @@ void InputDispatcher::prepareDispatchCycleLocked(nsecs_t currentTime,
             ALOGD("channel '%s' ~ Split motion event.",
                     connection->getInputChannelName());
             logOutboundMotionDetailsLocked("  ", splitMotionEntry);
-#endif
+#endif      
             enqueueDispatchEntriesLocked(currentTime, connection,
                     splitMotionEntry, inputTarget);
             splitMotionEntry->release();
@@ -1836,13 +1876,16 @@ void InputDispatcher::prepareDispatchCycleLocked(nsecs_t currentTime,
     }
 
     // Not splitting.  Enqueue dispatch entries for the event as is.
+    //以上是错误处理,以及对多点触摸事件分割处理
+    //将事件添加到Connection发送队列中
     enqueueDispatchEntriesLocked(currentTime, connection, eventEntry, inputTarget);
 }
 
 void InputDispatcher::enqueueDispatchEntriesLocked(nsecs_t currentTime,
         const sp<Connection>& connection, EventEntry* eventEntry, const InputTarget* inputTarget) {
     bool wasEmpty = connection->outboundQueue.isEmpty();
-
+    /*将事件信息分住封装成DispatchEntry,然后注入Connection的发送队列中,FLAG_DISPATCH_AS_IS表示不朽该事件的
+        action类型,按原样添加到发送队列*/
     // Enqueue dispatch entries for the requested modes.
     enqueueDispatchEntryLocked(connection, eventEntry, inputTarget,
             InputTarget::FLAG_DISPATCH_AS_HOVER_EXIT);
@@ -1858,6 +1901,7 @@ void InputDispatcher::enqueueDispatchEntriesLocked(nsecs_t currentTime,
             InputTarget::FLAG_DISPATCH_AS_SLIPPERY_ENTER);
 
     // If the outbound queue was previously empty, start the dispatch cycle going.
+    //如果Connection的发送队列从空到有事件,则立即启动发送循环
     if (wasEmpty && !connection->outboundQueue.isEmpty()) {
         startDispatchCycleLocked(currentTime, connection);
     }
@@ -1959,7 +2003,7 @@ void InputDispatcher::startDispatchCycleLocked(nsecs_t currentTime,
     ALOGD("channel '%s' ~ startDispatchCycle",
             connection->getInputChannelName());
 #endif
-
+    //不断的从发送队列中获取DispatchEntry,并将事件发送到InputChannel
     while (connection->status == Connection::STATUS_NORMAL
             && !connection->outboundQueue.isEmpty()) {
         DispatchEntry* dispatchEntry = connection->outboundQueue.head;
@@ -1968,6 +2012,7 @@ void InputDispatcher::startDispatchCycleLocked(nsecs_t currentTime,
         // Publish the event.
         status_t status;
         EventEntry* eventEntry = dispatchEntry->eventEntry;
+        //根据不同的事件类型,选择InputPublicsher不同的发送函数
         switch (eventEntry->type) {
         case EventEntry::TYPE_KEY: {
             KeyEntry* keyEntry = static_cast<KeyEntry*>(eventEntry);
@@ -2036,6 +2081,7 @@ void InputDispatcher::startDispatchCycleLocked(nsecs_t currentTime,
 
         // Check the result.
         if (status) {
+            //如果发送失败,例如InputChannel的发送缓冲区满,则停止发送,下次执行此函数时再试
             if (status == WOULD_BLOCK) {
                 if (connection->waitQueue.isEmpty()) {
                     ALOGE("channel '%s' ~ Could not publish event because the pipe is full. "
@@ -2060,7 +2106,7 @@ void InputDispatcher::startDispatchCycleLocked(nsecs_t currentTime,
             }
             return;
         }
-
+        //将DispatchEntry转存到waitQueue,等待窗口反馈
         // Re-enqueue the event on the wait queue.
         connection->outboundQueue.dequeue(dispatchEntry);
         traceOutboundQueueLengthLocked(connection);
@@ -2131,7 +2177,7 @@ int InputDispatcher::handleReceiveCallback(int fd, int events, void* data) {
 
     { // acquire lock
         AutoMutex _l(d->mLock);
-
+        //①根据可读的InputChannel的描述符获取对应的Connection对象
         ssize_t connectionIndex = d->mConnectionsByFd.indexOfKey(fd);
         if (connectionIndex < 0) {
             ALOGE("Received spurious receive callback for unknown input channel.  "
@@ -2154,10 +2200,12 @@ int InputDispatcher::handleReceiveCallback(int fd, int events, void* data) {
             for (;;) {
                 uint32_t seq;
                 bool handled;
+                //②在循环中不断地读取尽可能多的反馈信息
                 status = connection->inputPublisher.receiveFinishedSignal(&seq, &handled);
                 if (status) {
                     break;
                 }
+                //③调用finishDispatchCycleLocked()函数完成对反馈的处理
                 d->finishDispatchCycleLocked(currentTime, connection, seq, handled);
                 gotOne = true;
             }
@@ -2501,11 +2549,12 @@ void InputDispatcher::notifyMotion(const NotifyMotionArgs* args) {
                 args->pointerCoords[i].getAxisValue(AMOTION_EVENT_AXIS_ORIENTATION));
     }
 #endif
+    //验证参数的有效性,motion事件主要是为了验证触控点的数量与Id是否在合理范围
     if (!validateMotionEvent(args->action, args->actionButton,
                 args->pointerCount, args->pointerProperties)) {
         return;
     }
-
+    //①输入时间进入派发队列之前,首先向DispatcherPolicy获取本事件的派发策略
     uint32_t policyFlags = args->policyFlags;
     policyFlags |= POLICY_FLAG_TRUSTED;
     mPolicy->interceptMotionBeforeQueueing(args->eventTime, /*byref*/ policyFlags);
@@ -2513,7 +2562,7 @@ void InputDispatcher::notifyMotion(const NotifyMotionArgs* args) {
     bool needWake;
     { // acquire lock
         mLock.lock();
-
+        //②把事件交给InputFilterLocked进行过滤
         if (shouldSendMotionToInputFilterLocked(args)) {
             mLock.unlock();
 
@@ -2523,8 +2572,9 @@ void InputDispatcher::notifyMotion(const NotifyMotionArgs* args) {
                     0, 0, args->xPrecision, args->yPrecision,
                     args->downTime, args->eventTime,
                     args->pointerCount, args->pointerProperties, args->pointerCoords);
-
+            //标记该事件已经过滤
             policyFlags |= POLICY_FLAG_FILTERED;
+            //启动过滤,如果返回false,此事件忽略
             if (!mPolicy->filterInputEvent(&event, policyFlags)) {
                 return; // event was consumed by the filter
             }
@@ -2533,6 +2583,7 @@ void InputDispatcher::notifyMotion(const NotifyMotionArgs* args) {
         }
 
         // Just enqueue a new motion event.
+        //③使用NotifyMotionArgs参数中的事件信息构造一个MotionEntry,放入queue中
         MotionEntry* newEntry = new MotionEntry(args->eventTime,
                 args->deviceId, args->source, policyFlags,
                 args->action, args->actionButton, args->flags,
@@ -2540,11 +2591,11 @@ void InputDispatcher::notifyMotion(const NotifyMotionArgs* args) {
                 args->edgeFlags, args->xPrecision, args->yPrecision, args->downTime,
                 args->displayId,
                 args->pointerCount, args->pointerProperties, args->pointerCoords, 0, 0);
-
+        //needWake,表示派发线程是否处于休眠状态,
         needWake = enqueueInboundEventLocked(newEntry);
         mLock.unlock();
     } // release lock
-
+    //④派发线程如果处理休眠状态,唤醒
     if (needWake) {
         mLooper->wake();
     }
@@ -3583,7 +3634,9 @@ void InputDispatcher::doDispatchCycleFinishedLockedInterruptible(
         // Note that because the lock might have been released, it is possible that the
         // contents of the wait queue to have been drained, so we need to double-check
         // a few things.
+        //从waitQueue中,按照需要去除反馈对应的啥时间
         if (dispatchEntry == connection->findWaitQueueEntry(seq)) {
+            //将事件从waitQueue中移除
             connection->waitQueue.dequeue(dispatchEntry);
             traceWaitQueueLengthLocked(connection);
             if (restartEvent && connection->status == Connection::STATUS_NORMAL) {
@@ -3595,6 +3648,7 @@ void InputDispatcher::doDispatchCycleFinishedLockedInterruptible(
         }
 
         // Start the next dispatch cycle for this connection.
+        //启动一下次发送循环
         startDispatchCycleLocked(now(), connection);
     }
 }
